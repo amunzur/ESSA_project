@@ -39,6 +39,18 @@ def ctDNA_fraction_het_SNPs(cnv_path, THRESHOLD_copy_status, THRESHOLD_het_SNPs_
 	cnvs["Copy_status"] = np.select(conditions, values)
 	cnvs['Copy_status'] = cnvs['Copy_status'].fillna(0) # anything else that doesn't fit the criteria above gets a 0.
 
+	# sex chromosomes get special treatment for CN calculation. We don't use SNP allele fraction for them. 
+	conditions = [
+		(cnvs.loc[cnvs.CHROMOSOME.isin(["chrX", "chrY"]), 'Log_ratio'] < -0.7), 
+		(cnvs.loc[cnvs.CHROMOSOME.isin(["chrX", "chrY"]), 'Log_ratio'] <= -0.20), 
+		(cnvs.loc[cnvs.CHROMOSOME.isin(["chrX", "chrY"]), 'Log_ratio'] > -0.3) & (cnvs.loc[cnvs.CHROMOSOME.isin(["chrX", "chrY"]), 'Log_ratio'] < 0.3), 
+		(cnvs.loc[cnvs.CHROMOSOME.isin(["chrX", "chrY"]), 'Log_ratio'] >= 0.20), 
+		(cnvs.loc[cnvs.CHROMOSOME.isin(["chrX", "chrY"]), 'Log_ratio'] > 0.7)]
+
+	values = [-2, -1, 0, 1, 2] # corresponding copy numbers to the conditions above
+	cnvs.loc[cnvs.CHROMOSOME.isin(["chrX", "chrY"]), "Copy_status"] = np.select(conditions, values)
+	cnvs.loc[cnvs.CHROMOSOME.isin(["chrX", "chrY"]),'Copy_status'] = cnvs['Copy_status'].fillna(0) # anything else that doesn't fit the criteria above gets a 0.
+
 	cnvs['Patient_ID'] = cnvs["Sample_ID"].str.split("-cfDNA|-WBC", expand = True)[0] # patient id from sample id
 
 	# Make a copy of the df to compute ctDNA% on applicable samples
@@ -50,12 +62,20 @@ def ctDNA_fraction_het_SNPs(cnv_path, THRESHOLD_copy_status, THRESHOLD_het_SNPs_
 	cnvs_ctdna['Sample_median_gene_SNP_VAF_all_genes'] = cnvs_ctdna['Median heterozygous SNP allele fraction'].groupby(cnvs_ctdna['Sample_ID']).transform('median') # Get "median of medians" per sample_ID
 
 	# Filter and calculate ctDNA% based on SNPs 
-	cnvs_ctdna = cnvs_ctdna[(cnvs_ctdna["Number of heterozygous SNPs"] > THRESHOLD_het_SNPs_count) & (cnvs_ctdna["Hetz_loss_count"] > THRESHOLD_het_loss_count) & (cnvs_ctdna['Chrom_count'] > THRESHOLD_chrom_count)] # filtering
+	foo=(cnvs_ctdna["Number of heterozygous SNPs"] > THRESHOLD_het_SNPs_count) & (cnvs_ctdna["Hetz_loss_count"] > THRESHOLD_het_loss_count) & (cnvs_ctdna['Chrom_count'] > THRESHOLD_chrom_count)
+	cnvs_ctdna = cnvs_ctdna[foo] # filtering
 	cnvs_ctdna['ctDNA_fraction_SNP_estimate'] = 2 - 1/cnvs_ctdna['Sample_median_gene_SNP_VAF_all_genes'] #Calculate tumour content from HSAFs in sLOH regions
 
 	# merge the chosen columns back to the original df
 	cnvs_ctdna = cnvs_ctdna[['ctDNA_fraction_SNP_estimate', 'Hetz_loss_count', 'Sample_ID']].drop_duplicates()
 	cnvs = pd.merge(cnvs, cnvs_ctdna, how='left', on=['Sample_ID'])
+
+	# move the Patient_ID col right after the Sample_ID col, pop it off and put it back to the correct position
+	x = cnvs.pop("Patient_ID")
+	cnvs.insert(1, 'Patient_ID', x)
+
+	x = cnvs_ctdna_copy.pop("Patient_ID")
+	cnvs_ctdna_copy.insert(1, 'Patient_ID', x)
 
 	return([cnvs, cnvs_ctdna_copy])
 
@@ -70,7 +90,7 @@ def generate_SNV_table(snv_path, cnvs, sample_labels, keep_only_called_variants,
 
 	snvs = pd.melt(snvs, id_vars = ['CHROM', 'POSITION', 'REF', 'ALT', 'GENE', 'EFFECT', 'NOTES']) # wide to long format
 	snvs = snvs.rename(columns = {'value': 'Allele_frequency','variable': 'Sample_ID'}, inplace = False)
-	snvs = pd.merge(snvs, sample_labels, how = 'left', on = 'Sample_ID')
+	snvs = pd.merge(snvs, sample_labels, how = 'left', on = 'Sample_ID') # so far no filtering, all muts included
 
 	# Subset to called variants only or keep everything
 	if keep_only_called_variants == True: 
@@ -120,23 +140,79 @@ def ctDNA_fraction_mutations(snvs, THRESHOLD_log_ratio, THRESHOLD_read_depth, ke
 	THRESHOLD_read_depth: only keep the variants with depth more than (40)
 	'''
 	snv_subset = snvs.copy()
+	snv_subset2 = snvs.copy()
 	
 	# We have the option to compute ctDNA% based on coding variants only. This may or may not make any difference based on what the muts with the highest vaf are.
 	if keep_only_coding_variants == True: 
 		snv_subset = snv_subset[snv_subset['Coding'] == True] # subset to coding variants
+		snv_subset2 = snv_subset2[snv_subset2['Coding'] == True] # subset to coding variants
 	else: 
 		pass
+	
+	# This df contains ctDNA fraction estimates using mutations on the X chromosome, considering only genes with a copy status of -1, 1 or 0.
+	snv_subset2 = snv_subset2[(snv_subset2['CHROM'] == "chrX") & 
+							(snv_subset2['Read_depth'] > THRESHOLD_read_depth) & 
+							(snv_subset2.Copy_status.isin([-1, 0])) & 
+							(snv_subset2['Independently_detected'] == True)].reset_index(drop = True)
 
+	snv_subset2["Max_Sample_ID_adj_VAF"] = snv_subset2.groupby('Sample_ID')["Adj_allele_frequency"].transform('max') # for each sample the vaf of the mutation with the highest vaf
+	snv_subset2 = snv_subset2[snv_subset2["Adj_allele_frequency"] == snv_subset2["Max_Sample_ID_adj_VAF"]] # only keep the muts with the highest vaf
+	snv_subset2['row_max'] = snv_subset2[['Read_depth']].max(axis = 1) # helps break tie and subset if there are more than one muts with the same adjusted vaf
+	snv_subset2 = snv_subset2.loc[snv_subset2.groupby('Sample_ID')['row_max'].idxmax()] # only keep the muts with the highest vaf
+
+	snv_subset2['Mutation_ctDNA_fraction'] = snv_subset2['Max_Sample_ID_adj_VAF'] # ctDNA% estimate using mutation calls in the sex chromosomes
+
+	############################################################################################################
+	
 	snv_subset["Max_Sample_ID_adj_VAF"] = snv_subset.groupby('Sample_ID')["Adj_allele_frequency"].transform('max') # for each sample the vaf of the mutation with the highest vaf
 	snv_subset = snv_subset[snv_subset["Adj_allele_frequency"] == snv_subset["Max_Sample_ID_adj_VAF"]] # only keep the muts with the highest vaf
 	snv_subset['row_max'] = snv_subset[['Read_depth']].max(axis = 1) # helps break tie and subset if there are more than one muts with the same adjusted vaf
 	snv_subset = snv_subset.loc[snv_subset.groupby('Sample_ID')['row_max'].idxmax()] # only keep the muts with the highest vaf
 
-	snv_subset = snv_subset[(snv_subset['Log_ratio'] < THRESHOLD_log_ratio) & (snv_subset['Read_depth'] > THRESHOLD_read_depth) & (snv_subset['Independently_detected'] == True) & (~snv_subset['CHROM'].isin(['chrX', 'chrY']))]
-	snv_subset = snv_subset.reset_index(drop = True)
+	# Continue filtering snv_subset to choose the right mutations for TF calculation.	
+	snv_subset = snv_subset[(snv_subset['Log_ratio'] < THRESHOLD_log_ratio) & (snv_subset['Read_depth'] > THRESHOLD_read_depth) & (snv_subset['Independently_detected'] == True) & (~snv_subset['CHROM'].isin(['chrX', 'chrY']))].reset_index(drop = True)
 
 	snv_subset['Mutation_ctDNA_fraction'] = 2/(1+1/(snv_subset['Max_Sample_ID_adj_VAF'])) # ctDNA% estimate using mutation calls
 	snv_subset = snv_subset[snv_subset['Log_ratio'].notna()]
+
+	############################################################################################################
+
+	# At this point we have two dfs with TF calculated based on two sets of mutations. We consider the sex chromosome calculations only if the somatic mutation calculations aren't available. 
+	# Both dfs are returned to be processed later on. 
+	# snv_subset: somatic mutations 
+	# snv_subset2: X chromosome mutations
+
+	return([snv_subset, snv_subset2])
+
+def add_TF_method(snv_subset): 
+	'''
+	Add a new col to the snv_subset dataframe to indicate how the TF estimate was computed. 
+	Assuming some merge was done on the snv_subset so that it has both mutation based and SNP based TF estimates. 
+	'''
+
+	col1         = "Mutation_ctDNA_fraction"
+	col2         = "ctDNA_fraction_SNP_estimate"
+
+	conditions   = [pd.isna(snv_subset[col1]) & pd.notna(snv_subset[col2]), # Mutation estimate unavailable: choose SNP estimate
+					pd.isna(snv_subset[col2]) & pd.notna(snv_subset[col1]), # SNP estimate unavailable: choose mutation estimate
+					pd.isna(snv_subset[col1]) & pd.isna(snv_subset[col2]), # both NA, leave NA
+					pd.notna(snv_subset[col1]) & pd.notna(snv_subset[col2])] # neither is NA: choose mutation
+
+	choices      = [ "SNP", "Mutation", "NA", "Mutation"]
+	snv_subset["TF_method"] = np.select(conditions, choices)
+
+	return(snv_subset)
+
+def add_final_TF(snv_subset): 
+	'''
+	Add a new col to the snv_subset dataframe to indicate the final TF estimate. 
+	Same criteria as add_TF_method(snv_subset) is used.
+	'''
+
+	col1 = "Mutation_ctDNA_fraction"
+	col2 = "ctDNA_fraction_SNP_estimate"
+	
+	snv_subset["Final_TF"] = (snv_subset[col1].fillna(0) + snv_subset[col2].fillna(0)).replace(0, np.nan)
 
 	return(snv_subset)
 
@@ -148,6 +224,7 @@ def get_adj_maf(maf, depth):
         if dist.cdf(alt) < 0.95:
             maf = p; break;
     return maf;
+
 
 # =============================================================================
 # Load raw data
@@ -167,42 +244,40 @@ snv_path = os.path.join(base_path, "essa_mutations.tsv")
 snvs = generate_SNV_table(snv_path = snv_path, cnvs = cnvs, sample_labels = sample_labels, keep_only_called_variants = False, keep_only_coding_variants = False)
 
 # Select the appropriate snvs to calculate tumor content based on mutations, we just computed the SNP based on ctDNA% estimates based on the cnvs file
-snv_subset = ctDNA_fraction_mutations(snvs = snvs, THRESHOLD_log_ratio = 0.2, THRESHOLD_read_depth = 40, keep_only_coding_variants = True)
+snv_subset = ctDNA_fraction_mutations(snvs = snvs, THRESHOLD_log_ratio = 0.2, THRESHOLD_read_depth = 40, keep_only_coding_variants = True)[0] # TF based on somatic muts
+snv_subset2 = ctDNA_fraction_mutations(snvs = snvs, THRESHOLD_log_ratio = 0.2, THRESHOLD_read_depth = 40, keep_only_coding_variants = True)[1] # TF based on sex chromosomes
+
+snv_subset = pd.merge(snv_subset, cnvs[["Sample_ID", "Patient_ID", "ctDNA_fraction_SNP_estimate"]].drop_duplicates(), how = "outer", on = ["Sample_ID", 'Patient_ID']) # add SNP estimate, this also helps understand which samples have an NA for a TF estimate
+snv_subset = pd.merge(snv_subset, cnvs_ctdna_copy[['Hetz_loss_count', 'Sample_ID', 'Patient_ID']].drop_duplicates(), how='outer', on = ['Sample_ID', "Patient_ID"]) # add number of genes with het loss
+# At this point now we have information about which samples have a TF estimate based on somatic mutations. We will make use of snv_subset2 to compute a TF for samples without a TF estimate based on somatic mutations. 
+
+idx = snv_subset2["Sample_ID"].isin(snv_subset[snv_subset['Mutation_ctDNA_fraction'].isnull()].Sample_ID) # index of sample IDs in snv_subset2 that doesn't have a somatic mutation based TF estimate 
+snv_subset2 = snv_subset2[idx] # subset to samples whose TF will be calculated based on sex chr calculations
+
+# Final df that contains the TF estimates calculated by somatic and sex chr estimates. 
+snv_subset = pd.concat([snv_subset, snv_subset2]).drop_duplicates(subset = "Sample_ID", keep='last').reset_index(drop = True) # slap the two dfs together, snv_subset contains TF based on somatic mutations, snv_subset2 contains TF based on sex chr mutations 
+
 snvs = pd.merge(snvs, snv_subset[['Max_Sample_ID_adj_VAF', 'Mutation_ctDNA_fraction', 'Sample_ID']].drop_duplicates(), how='left', on='Sample_ID') # Merge snv_subset and snv to add ctDNA% estimates based on mutation counts to the snvs table
 
 # subset to chosen columns in this order
-snvs = snvs[['Sample_ID','Patient_ID','CHROM', 'POSITION', 'REF', 'ALT',
+reordered_columns = ['Sample_ID','Patient_ID','CHROM', 'POSITION', 'REF', 'ALT',
        'GENE', 'Protein_annotation', 'Mutation_type', 'NOTES', 'Allele_frequency', 'Independently_detected', 'Coding', 
        'Putatively_deleterious', 'Read_depth', 'Mutant_reads', 'Copy_status',
-       'Log_ratio', 'Lower_95_CI_VAF', 'Upper_95_CI_VAF', 'Max_Sample_ID_adj_VAF', 'Mutation_ctDNA_fraction']]
+       'Log_ratio', 'Lower_95_CI_VAF', 'Upper_95_CI_VAF', 'Max_Sample_ID_adj_VAF', 'Mutation_ctDNA_fraction']
 
-snv_subset = snv_subset[snvs.columns]
-snv_subset = pd.merge(snv_subset, cnvs[["Sample_ID", "Patient_ID", "ctDNA_fraction_SNP_estimate"]].drop_duplicates(), how = "outer", on = ["Sample_ID", 'Patient_ID']) # add SNP estimate
-snv_subset = pd.merge(snv_subset, cnvs_ctdna_copy[['Hetz_loss_count', 'Sample_ID', 'Patient_ID']].drop_duplicates(), how='outer', on = ['Sample_ID', "Patient_ID"]) # add number of genes with het loss
-# add number of somatic mutations 
+snvs = snvs[reordered_columns]
+snv_subset = snv_subset[reordered_columns + ['ctDNA_fraction_SNP_estimate']]
+
+snv_subset = add_TF_method(snv_subset) # add a col to indicate 
+snv_subset = add_final_TF(snv_subset)
+
+# Clean up the TF estimates, add a new col to indicate how the TF was computed: mutation, SNP or manual. 
 
 # Save both tsv and csv files for ease of access
-snvs.to_csv(os.path.join(output_path, "all_snvs_essa.tsv"), sep='\t', index=False)
-snv_subset.to_csv(os.path.join(output_path, "ctdna_frac_variants.tsv"), sep='\t', index=False)
-cnvs.to_csv(os.path.join(output_path, "all_cnvs_essa.tsv"), sep='\t', index=False)
+snvs.to_csv(os.path.join(output_path, "all_snvs_essa.tsv"), sep='\t', index=False, na_rep='NA')
+snv_subset.to_csv(os.path.join(output_path, "ctdna_frac_variants.tsv"), sep='\t', index=False, na_rep='NA')
+cnvs.to_csv(os.path.join(output_path, "all_cnvs_essa.tsv"), sep='\t', index=False, na_rep='NA')
 
-snvs.to_csv(os.path.join(output_path, "all_snvs_essa.csv"), index=False)
-snv_subset.to_csv(os.path.join(output_path, "ctdna_frac_variants.csv"), index=False)
-cnvs.to_csv(os.path.join(output_path, "all_cnvs_essa.csv"), index=False)
-
-
-'''
-gsheet_entries = pd.read_csv('https://docs.google.com/spreadsheets/d/1JnMQ8TM0yqObGyy5x2VgIED9tV4a9h0sqQsm-e3ny3o/export?format=csv&gid=149939303', error_bad_lines=False, dtype='str')
-
-ctDNA_frac_values_for_gsheet = snv_subset[['Patient_ID','Mutation_ctDNA_fraction']].drop_duplicates()
-ctDNA_frac_values_for_gsheet = ctDNA_frac_values_for_gsheet.fillna(0)
-ctDNA_frac_values_for_gsheet = ctDNA_frac_values_for_gsheet.sort_values(by=['Mutation_ctDNA_fraction']).reset_index(drop=True)
-ctDNA_frac_values_for_gsheet.columns = ['Patient_ID', 'ctDNA']
-ctDNA_frac_values_for_gsheet['ctDNA'] = ctDNA_frac_values_for_gsheet['ctDNA']*100
-gsheet_entries = pd.merge(gsheet_entries, ctDNA_frac_values_for_gsheet, how='left', left_on='Pt. ID', right_on='Patient_ID')
-
-'''
-
-
-
-
+snvs.to_csv(os.path.join(output_path, "all_snvs_essa.csv"), index=False, na_rep='NA')
+snv_subset.to_csv(os.path.join(output_path, "ctdna_frac_variants.csv"), index=False, na_rep='NA')
+cnvs.to_csv(os.path.join(output_path, "all_cnvs_essa.csv"), index=False, na_rep='NA')
