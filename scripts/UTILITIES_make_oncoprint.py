@@ -46,6 +46,44 @@ def reorder_dfs(df_cn_main, df_muts):
 
     return(df_cn_main)
 
+def add_CN_mut_presence(df_cn, df_muts):
+    '''
+    A new df that indicates the presence absence of CN changes and mutations on a per gene for each patient basis 
+    '''
+    df_muts = df_muts.drop_duplicates(["Patient_ID", "GENE"], keep= 'last') # so that we don't double count if a patient has more than one mutation per gene when calculating the alteration frequency
+    combined = pd.merge(df_cn[["Patient_ID", "GENE", "Copy_status"]], df_muts[["Patient_ID", "GENE", "POSITION"]], how = "left", on = ["Patient_ID", "GENE"])
+    combined["CN_change_presence"] = combined["Copy_status"] != 0
+    combined["mutation_presence"] = combined["POSITION"].notna()
+
+    # now mini function to indicate the number of alterations:
+    conditions = [
+        (combined['CN_change_presence'] == True) & (combined['mutation_presence'] == False), 
+        (combined['CN_change_presence'] == False) & (combined['mutation_presence'] == True),
+        (combined['CN_change_presence'] == False) & (combined['mutation_presence'] == False), 
+        (combined['CN_change_presence'] == True) & (combined['mutation_presence'] == True)]
+
+    values = [1, 1, 0, 1]
+    combined["total_alteration_patient_gene"] = np.select(conditions, values) # add a new col with the number of total alterations for the gene and patient couple
+
+    # And now group by and count the number of alterations per gene based on the value computed above
+    combined['total_alteration_gene'] = combined["total_alteration_patient_gene"].groupby(combined['GENE']).transform('sum') # number of mutations each patient has
+    combined = combined[["total_alteration_gene", "GENE"]].drop_duplicates().reset_index(drop = True)
+    combined["total_alteration_perc"] = round((combined["total_alteration_gene"] / len(df_cn["Patient_ID"].unique()))*100).astype(int)
+   
+    del combined["total_alteration_gene"]
+
+    df_cn = pd.merge(df_cn, combined, how = "left", on = "GENE")
+    df_muts = pd.merge(df_muts, combined, how = "left", on = "GENE")
+
+    # now reorder the dfs based on the mutation alteration percentage within the PATHWAY group
+    df_cn = df_cn.sort_values(['total_alteration_perc'], ascending = False) \
+    .groupby(['PATHWAY'], sort = False) \
+    .apply(lambda x: x.sort_values(['total_alteration_perc'], ascending = False)) \
+    .reset_index(drop = True)
+
+    return([df_cn, df_muts])
+
+
 def process_df_TF(df_TF, df_cn):
     '''
     Modify the tumor fraction df to choose the needed columns and convert TF to percentage, and sort by sample ID 
